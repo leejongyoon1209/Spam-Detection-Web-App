@@ -21,6 +21,27 @@ MIRROR_URL = "https://raw.githubusercontent.com/debopriyobhowmick/sms_spam_class
 ZIP_PATH = DATA_DIR / "sms_spam_collection.zip"
 DATA_PATH = DATA_DIR / "SMSSpamCollection"
 
+# Small, manually curated supplement for realistic payment and billing phishing.
+# The comparison message used in the experiment is intentionally not included.
+SUPPLEMENTAL_SPAM_MESSAGES = [
+    "Your payment was declined. Confirm your card details now to prevent account suspension.",
+    "We were unable to verify your latest payment. Sign in to the billing portal to update your details.",
+    "Payment alert: your invoice is overdue. Review and settle the balance at the secure payment page.",
+    "Your card payment needs verification. Complete the billing check now to keep your service active.",
+    "A problem was found with your payment method. Confirm your billing information immediately.",
+    "Your subscription payment failed. Update your payment details today to avoid cancellation.",
+    "Billing notice: we could not collect your scheduled payment. Verify your account to retry it.",
+    "Your recent transaction is on hold. Confirm the payment information to release it.",
+    "Action required: your invoice payment is pending. Open the payment review page before it expires.",
+    "We need to recheck your card for the outstanding invoice. Submit your billing details to continue.",
+    "Payment verification required. Use the secure account page to confirm your billing information.",
+    "Your account billing could not be completed. Update the saved card before access is restricted.",
+    "A failed payment may interrupt your service. Confirm your payment method now.",
+    "Your electronic invoice is ready but payment details are invalid. Review them immediately.",
+    "The bank could not authorize your payment. Verify your billing profile to avoid another failure.",
+    "Your payment account needs an urgent security check before the next charge can be processed.",
+]
+
 
 def download_dataset():
     if DATA_PATH.exists():
@@ -44,6 +65,11 @@ def download_dataset():
 def main():
     download_dataset()
     df = pd.read_csv(DATA_PATH, sep="\t", header=None, names=["label", "message"], encoding="utf-8")
+    supplement = pd.DataFrame({
+        "label": ["spam"] * len(SUPPLEMENTAL_SPAM_MESSAGES),
+        "message": SUPPLEMENTAL_SPAM_MESSAGES,
+    })
+    df = pd.concat([df, supplement], ignore_index=True)
     x_train, x_test, y_train, y_test = train_test_split(
         df["message"], df["label"], test_size=0.2, random_state=42, stratify=df["label"]
     )
