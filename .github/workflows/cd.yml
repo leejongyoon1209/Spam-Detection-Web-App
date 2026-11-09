@@ -43,10 +43,13 @@ jobs:
           $stopPath = Join-Path $stateDir 'stop'
           $logPath = Join-Path $stateDir 'availability.csv'
           $scriptPath = Join-Path $stateDir 'monitor.ps1'
+          $stdoutPath = Join-Path $stateDir 'monitor.stdout.log'
+          $stderrPath = Join-Path $stateDir 'monitor.stderr.log'
 
           Set-Content -LiteralPath $phasePath -Value 'before' -Encoding utf8
           Set-Content -LiteralPath $logPath -Value 'timestamp,phase,status_code,success,response_ms,error' -Encoding utf8
           Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
 
           $monitorScript = @'
           param(
@@ -76,7 +79,7 @@ jobs:
               $success = ($statusCode -eq 200)
             } catch {
               $errorText = $_.Exception.Message.Replace(',', ';')
-              Write-Warning "Availability check failed for $Url: $errorText"
+              Write-Warning "Availability check failed for ${Url}: $errorText"
             } finally {
               $watch.Stop()
               $client.Dispose()
@@ -90,7 +93,7 @@ jobs:
           '@
 
           Set-Content -LiteralPath $scriptPath -Value $monitorScript -Encoding utf8
-          $monitor = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @(
+          $monitor = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ArgumentList @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
             '-PhasePath', $phasePath, '-StopPath', $stopPath, '-LogPath', $logPath,
             '-Url', "http://127.0.0.1:$env:STABLE_PORT/"
@@ -101,7 +104,36 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_LOG=$logPath"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_PHASE=$phasePath"
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_STOP=$stopPath"
-          Start-Sleep -Seconds 3
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_STDOUT=$stdoutPath"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_STDERR=$stderrPath"
+
+          $firstRequestRecorded = $false
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Date) -lt $deadline) {
+            $monitorProcess = Get-Process -Id $monitor.Id -ErrorAction SilentlyContinue
+            $dataRows = @()
+            if (Test-Path -LiteralPath $logPath) {
+              $dataRows = @(Get-Content -LiteralPath $logPath | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            }
+            if ($dataRows.Count -ge 1) {
+              $firstRequestRecorded = $true
+              Write-Host "Availability monitor is alive and recorded its first request."
+              break
+            }
+            if (-not $monitorProcess) {
+              Write-Host 'Availability monitor exited before recording its first request.'
+              if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+              if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+              throw 'Availability monitor stopped before recording its first request.'
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $firstRequestRecorded) {
+            Write-Host 'Availability monitor did not record a request within 30 seconds.'
+            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+            throw 'Availability monitor startup verification failed.'
+          }
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -283,6 +315,7 @@ jobs:
               throw 'Initial proxy health check failed.'
             }
             Set-Phase 'after'
+            Start-Sleep -Seconds 10
             Write-Host 'Initial Blue-Green environment created with blue active.'
             exit 0
           }
@@ -416,6 +449,7 @@ jobs:
 
           docker rm -f $activeName | Out-Null
           Set-Phase 'after'
+          Start-Sleep -Seconds 10
           Write-Host "Traffic switched from '$activeName' to '$candidateName'."
 
       - name: Stop availability monitor and write Job Summary
@@ -429,9 +463,18 @@ jobs:
             Wait-Process -Id ([int]$env:SPAM_CD_MONITOR_PID) -Timeout 15 -ErrorAction SilentlyContinue
           }
 
-          if (-not (Test-Path -LiteralPath $env:SPAM_CD_LOG)) {
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "## Blue-Green deployment`n`nAvailability monitor did not produce a log.`n"
-            exit 0
+          if ($env:SPAM_CD_MONITOR_STDOUT -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDOUT)) {
+            Write-Host '--- availability monitor stdout ---'
+            Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDOUT
+          }
+          if ($env:SPAM_CD_MONITOR_STDERR -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDERR)) {
+            Write-Warning '--- availability monitor stderr ---'
+            Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDERR
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:SPAM_CD_LOG) -or -not (Test-Path -LiteralPath $env:SPAM_CD_LOG)) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "## Blue-Green deployment`n`nAvailability monitor did not produce a log. Verification failed.`n"
+            throw 'Availability monitor log is missing.'
           }
 
           $rows = Import-Csv -LiteralPath $env:SPAM_CD_LOG
@@ -455,7 +498,7 @@ jobs:
             if ($gap -gt $maxGap) { $maxGap = $gap }
           }
 
-          $outage = if ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
+          $outage = if ($total -eq 0) { 'UNKNOWN — no HTTP requests were recorded; verification failed' } elseif ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
           $mode = if ($env:SPAM_CD_MODE) { $env:SPAM_CD_MODE } else { 'unknown (deployment stopped before mode detection)' }
           $summary = @(
             '## Blue-Green deployment availability summary',
@@ -464,6 +507,9 @@ jobs:
             "- Total requests: **$total**",
             "- Successful requests: **$success**",
             "- Failed requests: **$failed**",
+            "- Before successful/failed: **$beforeSuccess / $beforeFailed**",
+            "- During successful/failed: **$duringSuccess / $duringFailed**",
+            "- After successful/failed: **$afterSuccess / $afterFailed**",
             "- Maximum request interval: **$([Math]::Round($maxGap, 2)) seconds**",
             "- Service interruption detected: **$outage**",
             '',
@@ -477,6 +523,13 @@ jobs:
             "Availability log artifact: ``$env:SPAM_CD_LOG``"
           )
           Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
+
+          if ($total -eq 0) {
+            throw 'Availability verification failed: Total requests is 0.'
+          }
+          if ($before -lt 1 -or $during -lt 1 -or $after -lt 1) {
+            throw "Availability verification failed: each phase needs at least one request (before=$before, during=$during, after=$after)."
+          }
 
       - name: Upload availability log
         if: always() && env.SPAM_CD_LOG != ''
