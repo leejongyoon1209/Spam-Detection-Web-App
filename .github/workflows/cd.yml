@@ -300,6 +300,7 @@ jobs:
               else { throw 'Current Nginx upstream is not Blue or Green.' }
               $activeState = docker inspect --format '{{.State.Status}}' $activeName 2>&1 | Out-String
               if ($activeState.Trim() -ne 'running') { throw "Active container '$activeName' is not running." }
+              if ($candidateName -eq $activeName) { throw "Safety check failed: candidate '$candidateName' is active. No application container will be removed." }
 
               $proxyInspect = docker inspect $proxyName | ConvertFrom-Json
               $fixedConfigNormalized = Normalize-PathForComparison $configPath
@@ -318,6 +319,7 @@ jobs:
               Set-Phase 'during'
               Assert-Monitor 'during'
               Wait-ForPhaseRequest 'during'
+              Write-Host "Replacing only inactive standby container '$candidateName'; active '$activeName' is protected."
               docker rm -f $candidateName 2>$null
               docker run -d --name $candidateName --restart unless-stopped -p "127.0.0.1:$candidatePort`:5000" $env:IMAGE_NAME | Out-Null
               $candidateState = docker inspect --format '{{.State.Status}}' $candidateName 2>&1 | Out-String
@@ -350,12 +352,14 @@ jobs:
                 docker rm -f $candidateName | Out-Null
                 throw 'Stable proxy health check failed; traffic was rolled back.'
               }
-              Write-Host "Traffic switch is stable; keeping active container '$activeName' alive for a 15-second grace period."
+              Write-Host "Traffic switch is stable; retaining previous active '$activeName' as standby for a 15-second grace period."
               Start-Sleep -Seconds 15
-              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { throw 'Pre-removal grace-period stability check failed; active container was not removed.' }
-              if (-not (Test-Http "http://127.0.0.1:$env:STABLE_PORT/" 10)) { throw 'Final pre-removal HTTP check failed; active container was not removed.' }
-              docker rm -f $activeName | Out-Null
-              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { throw 'Post-removal stability check failed after active container removal.' }
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { throw 'Post-switch grace-period stability check failed; standby was retained.' }
+              if (-not (Test-Http "http://127.0.0.1:$env:STABLE_PORT/" 10)) { throw 'Final post-switch HTTP check failed; standby was retained.' }
+              $standbyState = docker inspect --format '{{.State.Status}}' $activeName 2>&1 | Out-String
+              $newActiveState = docker inspect --format '{{.State.Status}}' $candidateName 2>&1 | Out-String
+              if ($standbyState.Trim() -ne 'running' -or $newActiveState.Trim() -ne 'running') { throw "Blue-Green invariant failed: standby='$standbyState', new_active='$newActiveState'. No application container was removed." }
+              Write-Host "Both application containers remain running: active='$candidateName', standby='$activeName'."
               Set-Phase 'after'
               Assert-Monitor 'after'
               Wait-ForPhaseRequest 'after'
