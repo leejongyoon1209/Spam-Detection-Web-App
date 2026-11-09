@@ -31,8 +31,14 @@ jobs:
       - name: Start availability monitor
         shell: powershell
         run: |
-          $stateDir = Join-Path $env:RUNNER_TEMP "spam-cd-$env:GITHUB_RUN_ID"
+          if ([string]::IsNullOrWhiteSpace($env:TEMP)) {
+            throw 'Windows TEMP environment variable is not available.'
+          }
+          $stateDir = Join-Path $env:TEMP "spam-cd-$env:GITHUB_RUN_ID"
           New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+          if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) {
+            throw "Could not create temporary CD state directory: $stateDir"
+          }
           $phasePath = Join-Path $stateDir 'phase.txt'
           $stopPath = Join-Path $stateDir 'stop'
           $logPath = Join-Path $stateDir 'availability.csv'
