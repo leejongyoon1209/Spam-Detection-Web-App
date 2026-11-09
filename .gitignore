@@ -33,6 +33,9 @@ coverage.xml
 *.pem
 *.key
 
+# GitHub Actions self-hosted runner installation and runtime files
+actions-runner/
+
 # IDE and OS files
 .vscode/
 .idea/

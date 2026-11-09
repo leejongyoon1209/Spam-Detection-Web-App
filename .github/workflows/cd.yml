@@ -1,0 +1,73 @@
+name: Deploy Docker Image to Self-hosted Runner
+
+on:
+  workflow_run:
+    workflows:
+      - Build and Push Docker Image
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: [self-hosted, windows, x64]
+
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/spam-detection-web-app:latest
+      CONTAINER_NAME: spam-detection-web-app
+      HOST_PORT: '5000'
+      CONTAINER_PORT: '5000'
+
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull latest image
+        shell: powershell
+        run: docker pull $env:IMAGE_NAME
+
+      - name: Replace existing application container
+        shell: powershell
+        run: |
+          $existing = docker ps -aq --filter "name=^$env:CONTAINER_NAME$"
+          if ($existing) {
+            docker rm -f $existing
+          }
+
+      - name: Start new application container
+        shell: powershell
+        run: >
+          docker run -d
+          --name $env:CONTAINER_NAME
+          --restart unless-stopped
+          -p "$env:HOST_PORT`:$env:CONTAINER_PORT"
+          $env:IMAGE_NAME
+
+      - name: Check container status
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 5
+          $status = docker inspect --format '{{.State.Status}}' $env:CONTAINER_NAME
+          if ($status -ne 'running') {
+            docker logs $env:CONTAINER_NAME
+            throw "Container status is '$status', expected 'running'."
+          }
+          docker ps --filter "name=^$env:CONTAINER_NAME$"
+
+      - name: Verify HTTP service
+        shell: powershell
+        run: |
+          $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$env:HOST_PORT/" -TimeoutSec 30
+          if ($response.StatusCode -ne 200) {
+            throw "HTTP verification returned status $($response.StatusCode)."
+          }
+          Write-Host "HTTP verification succeeded with status $($response.StatusCode)."

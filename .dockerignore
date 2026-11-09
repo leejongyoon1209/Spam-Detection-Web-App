@@ -8,6 +8,7 @@ __pycache__
 data
 model
 upload
+actions-runner
 *.zip
 *.docx
 2020105645_이종윤_HW2
