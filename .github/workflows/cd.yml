@@ -129,7 +129,7 @@ jobs:
           }
 
           function Write-ProxyConfig([string]$backendPort) {
-            @"
+            $content = @"
           events {}
           http {
               server {
@@ -142,7 +142,9 @@ jobs:
                   }
               }
           }
-          "@ | Set-Content -LiteralPath $configPath -Encoding utf8
+          "@
+            $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+            [System.IO.File]::WriteAllText($configPath, $content, $utf8NoBom)
           }
 
           $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
