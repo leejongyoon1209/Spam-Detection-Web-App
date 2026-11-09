@@ -350,9 +350,12 @@ jobs:
                 docker rm -f $candidateName | Out-Null
                 throw 'Stable proxy health check failed; traffic was rolled back.'
               }
-              Start-Sleep -Seconds 2
-              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) { throw 'Post-switch stabilization failed; active container was not removed.' }
+              Write-Host "Traffic switch is stable; keeping active container '$activeName' alive for a 15-second grace period."
+              Start-Sleep -Seconds 15
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { throw 'Pre-removal grace-period stability check failed; active container was not removed.' }
+              if (-not (Test-Http "http://127.0.0.1:$env:STABLE_PORT/" 10)) { throw 'Final pre-removal HTTP check failed; active container was not removed.' }
               docker rm -f $activeName | Out-Null
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { throw 'Post-removal stability check failed after active container removal.' }
               Set-Phase 'after'
               Assert-Monitor 'after'
               Wait-ForPhaseRequest 'after'
@@ -383,11 +386,21 @@ jobs:
               $beforeFailed = $before - $beforeSuccess
               $duringFailed = $during - $duringSuccess
               $afterFailed = $after - $afterSuccess
+              $failedRows = @($rows | Where-Object { $_.success -ne 'True' })
               $times = @($rows | ForEach-Object { [DateTime]::Parse($_.timestamp) } | Sort-Object)
               $maxGap = 0
               for ($i=1; $i -lt $times.Count; $i++) { $gap=($times[$i]-$times[$i-1]).TotalSeconds; if($gap -gt $maxGap){$maxGap=$gap} }
               $outage = if ($total -eq 0) { 'UNKNOWN — no HTTP requests were recorded; verification failed' } elseif ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
-              $summary = @('## Blue-Green deployment availability summary','',"- Deployment mode: **$mode**","- Total requests: **$total**","- Successful requests: **$success**","- Failed requests: **$failed**","- Before successful/failed: **$beforeSuccess / $beforeFailed**","- During successful/failed: **$duringSuccess / $duringFailed**","- After successful/failed: **$afterSuccess / $afterFailed**","- Maximum request interval: **$([Math]::Round($maxGap,2)) seconds**","- Service interruption detected: **$outage**",'',"| Phase | Requests |","|---|---:|","| Before deployment | $before |","| During deployment | $during |","| After deployment | $after |",'',"Availability log: ``$logPath``")
+              $summary = @('## Blue-Green deployment availability summary','',"- Deployment mode: **$mode**","- Total requests: **$total**","- Successful requests: **$success**","- Failed requests: **$failed**","- Before successful/failed: **$beforeSuccess / $beforeFailed**","- During successful/failed: **$duringSuccess / $duringFailed**","- After successful/failed: **$afterSuccess / $afterFailed**","- Maximum request interval: **$([Math]::Round($maxGap,2)) seconds**","- Service interruption detected: **$outage**",'',"| Phase | Requests |","|---|---:|","| Before deployment | $before |","| During deployment | $during |","| After deployment | $after |",'', '### Failed request details')
+              if ($failedRows.Count -eq 0) {
+                $summary += '- None'
+              } else {
+                foreach ($failedRow in ($failedRows | Select-Object -First 20)) {
+                  $summary += "- $($failedRow.timestamp) | phase=$($failedRow.phase) | status=$($failedRow.status_code) | response_ms=$($failedRow.response_ms) | error=$($failedRow.error)"
+                }
+              }
+              $summary += ""
+              $summary += "Availability log: ``$logPath``"
               Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
               if ($total -eq 0 -or $before -lt 1 -or $during -lt 1 -or $after -lt 1) { $verificationError = "Availability verification incomplete: total=$total, before=$before, during=$during, after=$after" }
             } else { $verificationError = 'Availability CSV was not created.' }
