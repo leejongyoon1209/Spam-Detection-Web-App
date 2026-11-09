@@ -56,6 +56,8 @@ jobs:
             [string]$Url
           )
 
+          Add-Type -AssemblyName System.Net.Http
+
           while (-not (Test-Path -LiteralPath $StopPath)) {
             $phase = if (Test-Path -LiteralPath $PhasePath) { (Get-Content -LiteralPath $PhasePath -Raw).Trim() } else { 'unknown' }
             $timestamp = (Get-Date).ToUniversalTime().ToString('o')
@@ -66,7 +68,7 @@ jobs:
 
             $handler = New-Object System.Net.Http.HttpClientHandler
             $handler.UseProxy = $false
-            $client = New-Object System.Net.Http.HttpClient($handler)
+            $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
             $client.Timeout = [TimeSpan]::FromSeconds(5)
             try {
               $response = $client.GetAsync($Url).GetAwaiter().GetResult()
@@ -74,6 +76,7 @@ jobs:
               $success = ($statusCode -eq 200)
             } catch {
               $errorText = $_.Exception.Message.Replace(',', ';')
+              Write-Warning "Availability check failed for $Url: $errorText"
             } finally {
               $watch.Stop()
               $client.Dispose()
@@ -119,39 +122,46 @@ jobs:
           $blueName = $env:BLUE_NAME
           $greenName = $env:GREEN_NAME
 
+          Add-Type -AssemblyName System.Net.Http
+
           function Set-Phase([string]$phase) {
             Set-Content -LiteralPath $env:SPAM_CD_PHASE -Value $phase -Encoding utf8
           }
 
           function Test-Http([string]$url, [int]$attempts = 30) {
+            $lastError = 'No HTTP 200 response received.'
             for ($i = 0; $i -lt $attempts; $i++) {
               $client = $null
               $handler = $null
               try {
                 $handler = New-Object System.Net.Http.HttpClientHandler
                 $handler.UseProxy = $false
-                $client = New-Object System.Net.Http.HttpClient($handler)
+                $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
                 $client.Timeout = [TimeSpan]::FromSeconds(5)
                 $response = $client.GetAsync($url).GetAwaiter().GetResult()
                 $statusCode = [int]$response.StatusCode
                 $client.Dispose()
                 $handler.Dispose()
                 if ($statusCode -eq 200) { return $true }
+                $lastError = "HTTP status $statusCode"
               } catch {
+                $lastError = $_.Exception.ToString().Replace([Environment]::NewLine, ' | ')
                 if ($client) { $client.Dispose() }
                 if ($handler) { $handler.Dispose() }
               }
               Start-Sleep -Seconds 1
             }
+            Write-Warning "HTTP health check failed for $url after $attempts attempts. Last error: $lastError"
             return $false
           }
 
           function Test-StableHttp([string]$url, [int]$requiredSuccesses = 10, [int]$attempts = 60) {
             $consecutive = 0
+            $lastError = 'No consecutive HTTP 200 responses received.'
             for ($i = 0; $i -lt $attempts; $i++) {
               $handler = New-Object System.Net.Http.HttpClientHandler
               $handler.UseProxy = $false
-              $client = New-Object System.Net.Http.HttpClient($handler)
+              $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
               $client.Timeout = [TimeSpan]::FromSeconds(5)
               try {
                 $response = $client.GetAsync($url).GetAwaiter().GetResult()
@@ -160,9 +170,11 @@ jobs:
                   $consecutive++
                   if ($consecutive -ge $requiredSuccesses) { return $true }
                 } else {
+                  $lastError = "HTTP status $statusCode"
                   $consecutive = 0
                 }
               } catch {
+                $lastError = $_.Exception.ToString().Replace([Environment]::NewLine, ' | ')
                 $consecutive = 0
               } finally {
                 $client.Dispose()
@@ -170,6 +182,7 @@ jobs:
               }
               Start-Sleep -Seconds 1
             }
+            Write-Warning "Stable HTTP check failed for $url after $attempts attempts. Last error: $lastError"
             return $false
           }
 
@@ -242,7 +255,28 @@ jobs:
           docker rm -f $candidateName 2>$null
           docker run -d --name $candidateName --restart unless-stopped -p "127.0.0.1:$candidatePort`:5000" $env:IMAGE_NAME | Out-Null
 
-          if (-not (Test-Http "http://127.0.0.1:$candidatePort/")) {
+          $candidateState = docker inspect --format '{{.State.Status}}' $candidateName 2>&1 | Out-String
+          Write-Host "Candidate docker state: $candidateState"
+          docker ps --filter "name=^$candidateName$"
+          $portOutput = docker port $candidateName 5000/tcp 2>&1 | Out-String
+          Write-Host "Candidate docker port mapping:`n$portOutput"
+          if ($candidateState.Trim() -ne 'running') {
+            docker logs $candidateName
+            throw "Candidate '$candidateName' is not running."
+          }
+          if ($portOutput -notmatch "127\.0\.0\.1:$candidatePort") {
+            docker logs $candidateName
+            throw "Candidate '$candidateName' does not expose host port $candidatePort."
+          }
+
+          $internalStatus = docker exec $candidateName python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5).status)" 2>&1 | Out-String
+          Write-Host "Candidate internal HTTP status: $internalStatus"
+          if ($internalStatus.Trim() -notmatch '^200$') {
+            docker logs $candidateName
+            throw "Candidate '$candidateName' did not return HTTP 200 from inside the container."
+          }
+
+          if (-not (Test-Http "http://127.0.0.1:$candidatePort/" 60)) {
             docker logs $candidateName
             throw "Candidate '$candidateName' failed its direct HTTP health check. Active '$activeName' was not changed."
           }
