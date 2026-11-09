@@ -237,10 +237,17 @@ jobs:
             [System.IO.File]::WriteAllText($configPath, $content, $utf8NoBom)
           }
 
+          function Get-NginxConfigDump {
+            $output = (& docker exec $proxyName sh -c 'nginx -T 2>&1' 2>&1 | Out-String).Trim()
+            $exitCode = $LASTEXITCODE
+            [pscustomobject]@{
+              Output = $output
+              ExitCode = $exitCode
+            }
+          }
+
           $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
           $legacyRunning = docker ps --filter 'name=^spam-detection-web-app$' --format '{{.Names}}'
-          $blueRunning = docker ps --filter "name=^$blueName$" --format '{{.Names}}'
-          $greenRunning = docker ps --filter "name=^$greenName$" --format '{{.Names}}'
 
           if (-not $proxyRunning) {
             if ($legacyRunning) {
@@ -267,21 +274,36 @@ jobs:
             exit 0
           }
 
-          if ($blueRunning) {
+          $proxyConfig = Get-NginxConfigDump
+          Write-Host "Current Nginx config dump exit code: $($proxyConfig.ExitCode)"
+          if ($proxyConfig.ExitCode -ne 0) {
+            Write-Host "Current Nginx config dump output: $($proxyConfig.Output)"
+            throw 'Could not read the current Nginx configuration. No container was removed.'
+          }
+
+          $currentConfig = $proxyConfig.Output
+          if ($currentConfig -match 'host\.docker\.internal:5001') {
             Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
             $activeName = $blueName
             $activePort = $env:BLUE_PORT
             $candidateName = $greenName
             $candidatePort = $env:GREEN_PORT
-          } elseif ($greenRunning) {
+          } elseif ($currentConfig -match 'host\.docker\.internal:5002') {
             Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
             $activeName = $greenName
             $activePort = $env:GREEN_PORT
             $candidateName = $blueName
             $candidatePort = $env:BLUE_PORT
           } else {
-            throw 'Proxy exists but neither blue nor green application container is running.'
+            throw 'Current Nginx upstream is neither host.docker.internal:5001 nor host.docker.internal:5002. No container was removed.'
           }
+
+          $activeState = docker inspect --format '{{.State.Status}}' $activeName 2>&1 | Out-String
+          if ($activeState.Trim() -ne 'running') {
+            throw "Nginx points to '$activeName' on port $activePort, but that active container is not running. No container was removed."
+          }
+          Write-Host "Active backend determined from Nginx upstream: $activeName on port $activePort"
+          Write-Host "Candidate selected as the opposite color: $candidateName on port $candidatePort"
 
           Set-Phase 'during'
           docker rm -f $candidateName 2>$null
@@ -315,9 +337,20 @@ jobs:
           docker exec $proxyName nginx -t
           docker exec $proxyName nginx -s reload
 
-          $loadedConfig = docker exec $proxyName nginx -T 2>&1 | Out-String
+          $loadedConfigResult = Get-NginxConfigDump
+          Write-Host "Post-reload Nginx config dump exit code: $($loadedConfigResult.ExitCode)"
+          if ($loadedConfigResult.ExitCode -ne 0) {
+            Write-Host "Post-reload Nginx config dump output: $($loadedConfigResult.Output)"
+            Write-ProxyConfig $activePort
+            docker exec $proxyName nginx -t
+            docker exec $proxyName nginx -s reload
+            throw 'nginx -T failed after reload. Traffic was not considered switched and no active container was removed.'
+          }
+
+          $loadedConfig = $loadedConfigResult.Output
           if ($loadedConfig -notmatch "host\.docker\.internal:$candidatePort") {
             Write-ProxyConfig $activePort
+            docker exec $proxyName nginx -t
             docker exec $proxyName nginx -s reload
             docker rm -f $candidateName | Out-Null
             throw "Nginx did not report the candidate upstream host.docker.internal:$candidatePort after reload. Traffic was not switched."
