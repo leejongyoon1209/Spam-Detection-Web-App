@@ -1,4 +1,4 @@
-name: Deploy Docker Image to Self-hosted Runner
+name: Blue-Green Deploy Docker Image
 
 on:
   workflow_run:
@@ -20,11 +20,74 @@ jobs:
 
     env:
       IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/spam-detection-web-app:latest
-      CONTAINER_NAME: spam-detection-web-app
-      HOST_PORT: '5000'
-      CONTAINER_PORT: '5000'
+      PROXY_NAME: spam-detection-proxy
+      BLUE_NAME: spam-detection-web-app-blue
+      GREEN_NAME: spam-detection-web-app-green
+      BLUE_PORT: '5001'
+      GREEN_PORT: '5002'
+      STABLE_PORT: '5000'
 
     steps:
+      - name: Start availability monitor
+        shell: powershell
+        run: |
+          $stateDir = Join-Path $env:RUNNER_TEMP "spam-cd-$env:GITHUB_RUN_ID"
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+          $phasePath = Join-Path $stateDir 'phase.txt'
+          $stopPath = Join-Path $stateDir 'stop'
+          $logPath = Join-Path $stateDir 'availability.csv'
+          $scriptPath = Join-Path $stateDir 'monitor.ps1'
+
+          Set-Content -LiteralPath $phasePath -Value 'before' -Encoding utf8
+          Set-Content -LiteralPath $logPath -Value 'timestamp,phase,status_code,success,response_ms,error' -Encoding utf8
+          Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
+
+          $monitorScript = @'
+          param(
+            [string]$PhasePath,
+            [string]$StopPath,
+            [string]$LogPath,
+            [string]$Url
+          )
+
+          while (-not (Test-Path -LiteralPath $StopPath)) {
+            $phase = if (Test-Path -LiteralPath $PhasePath) { (Get-Content -LiteralPath $PhasePath -Raw).Trim() } else { 'unknown' }
+            $timestamp = (Get-Date).ToUniversalTime().ToString('o')
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $statusCode = ''
+            $success = $false
+            $errorText = ''
+
+            try {
+              $response = Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 10
+              $statusCode = $response.StatusCode
+              $success = ($response.StatusCode -eq 200)
+            } catch {
+              $errorText = $_.Exception.Message.Replace(',', ';')
+            } finally {
+              $watch.Stop()
+            }
+
+            $line = '{0},{1},{2},{3},{4},{5}' -f $timestamp, $phase, $statusCode, $success, $watch.ElapsedMilliseconds, $errorText
+            Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8
+            Start-Sleep -Seconds 1
+          }
+          '@
+
+          Set-Content -LiteralPath $scriptPath -Value $monitorScript -Encoding utf8
+          $monitor = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
+            '-PhasePath', $phasePath, '-StopPath', $stopPath, '-LogPath', $logPath,
+            '-Url', "http://127.0.0.1:$env:STABLE_PORT/"
+          )
+
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_STATE_DIR=$stateDir"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_PID=$($monitor.Id)"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_LOG=$logPath"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_PHASE=$phasePath"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_STOP=$stopPath"
+          Start-Sleep -Seconds 3
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -35,39 +98,174 @@ jobs:
         shell: powershell
         run: docker pull $env:IMAGE_NAME
 
-      - name: Replace existing application container
+      - name: Deploy blue-green candidate and switch traffic
         shell: powershell
         run: |
-          $existing = docker ps -aq --filter "name=^$env:CONTAINER_NAME$"
-          if ($existing) {
-            docker rm -f $existing
+          $stateDir = $env:SPAM_CD_STATE_DIR
+          $configPath = Join-Path $stateDir 'nginx.conf'
+          $proxyName = $env:PROXY_NAME
+          $blueName = $env:BLUE_NAME
+          $greenName = $env:GREEN_NAME
+
+          function Set-Phase([string]$phase) {
+            Set-Content -LiteralPath $env:SPAM_CD_PHASE -Value $phase -Encoding utf8
           }
 
-      - name: Start new application container
-        shell: powershell
-        run: >
-          docker run -d
-          --name $env:CONTAINER_NAME
-          --restart unless-stopped
-          -p "$env:HOST_PORT`:$env:CONTAINER_PORT"
-          $env:IMAGE_NAME
+          function Test-Http([string]$url, [int]$attempts = 30) {
+            for ($i = 0; $i -lt $attempts; $i++) {
+              try {
+                $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 5
+                if ($response.StatusCode -eq 200) { return $true }
+              } catch { }
+              Start-Sleep -Seconds 1
+            }
+            return $false
+          }
 
-      - name: Check container status
+          function Write-ProxyConfig([string]$backendPort) {
+            @"
+          events {}
+          http {
+              server {
+                  listen 5000;
+                  location / {
+                      proxy_pass http://host.docker.internal:$backendPort;
+                      proxy_set_header Host `$host;
+                      proxy_set_header X-Real-IP `$remote_addr;
+                      proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
+                  }
+              }
+          }
+          "@ | Set-Content -LiteralPath $configPath -Encoding utf8
+          }
+
+          $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
+          $legacyRunning = docker ps --filter 'name=^spam-detection-web-app$' --format '{{.Names}}'
+          $blueRunning = docker ps --filter "name=^$blueName$" --format '{{.Names}}'
+          $greenRunning = docker ps --filter "name=^$greenName$" --format '{{.Names}}'
+
+          if (-not $proxyRunning) {
+            if ($legacyRunning) {
+              throw "Initial Blue-Green setup is required: legacy container '$legacyRunning' owns port 5000. It was left running to avoid downtime. Perform the one-time proxy migration before rerunning CD."
+            }
+
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=initial-setup'
+            Set-Phase 'during'
+            docker rm -f $blueName $greenName 2>$null
+            docker run -d --name $blueName --restart unless-stopped -p "127.0.0.1:$env:BLUE_PORT`:5000" $env:IMAGE_NAME | Out-Null
+            if (-not (Test-Http "http://127.0.0.1:$env:BLUE_PORT/")) {
+              docker logs $blueName
+              throw 'Blue candidate failed its direct HTTP health check.'
+            }
+
+            Write-ProxyConfig $env:BLUE_PORT
+            docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
+            if (-not (Test-Http "http://127.0.0.1:$env:STABLE_PORT/")) {
+              docker logs $proxyName
+              throw 'Initial proxy health check failed.'
+            }
+            Set-Phase 'after'
+            Write-Host 'Initial Blue-Green environment created with blue active.'
+            exit 0
+          }
+
+          if ($blueRunning) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
+            $activeName = $blueName
+            $activePort = $env:BLUE_PORT
+            $candidateName = $greenName
+            $candidatePort = $env:GREEN_PORT
+          } elseif ($greenRunning) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
+            $activeName = $greenName
+            $activePort = $env:GREEN_PORT
+            $candidateName = $blueName
+            $candidatePort = $env:BLUE_PORT
+          } else {
+            throw 'Proxy exists but neither blue nor green application container is running.'
+          }
+
+          Set-Phase 'during'
+          docker rm -f $candidateName 2>$null
+          docker run -d --name $candidateName --restart unless-stopped -p "127.0.0.1:$candidatePort`:5000" $env:IMAGE_NAME | Out-Null
+
+          if (-not (Test-Http "http://127.0.0.1:$candidatePort/")) {
+            docker logs $candidateName
+            throw "Candidate '$candidateName' failed its direct HTTP health check. Active '$activeName' was not changed."
+          }
+
+          Write-ProxyConfig $candidatePort
+          docker exec $proxyName nginx -t
+          docker exec $proxyName nginx -s reload
+
+          if (-not (Test-Http "http://127.0.0.1:$env:STABLE_PORT/")) {
+            Write-ProxyConfig $activePort
+            docker exec $proxyName nginx -s reload
+            docker rm -f $candidateName | Out-Null
+            throw "Stable proxy health check failed after switch. Traffic was rolled back to '$activeName'."
+          }
+
+          docker rm -f $activeName | Out-Null
+          Set-Phase 'after'
+          Write-Host "Traffic switched from '$activeName' to '$candidateName'."
+
+      - name: Stop availability monitor and write Job Summary
+        if: always()
         shell: powershell
         run: |
-          Start-Sleep -Seconds 5
-          $status = docker inspect --format '{{.State.Status}}' $env:CONTAINER_NAME
-          if ($status -ne 'running') {
-            docker logs $env:CONTAINER_NAME
-            throw "Container status is '$status', expected 'running'."
+          if ($env:SPAM_CD_STOP -and (Test-Path -LiteralPath $env:SPAM_CD_STOP)) {
+            New-Item -ItemType File -Force -Path $env:SPAM_CD_STOP | Out-Null
           }
-          docker ps --filter "name=^$env:CONTAINER_NAME$"
+          if ($env:SPAM_CD_MONITOR_PID) {
+            Wait-Process -Id ([int]$env:SPAM_CD_MONITOR_PID) -Timeout 15 -ErrorAction SilentlyContinue
+          }
 
-      - name: Verify HTTP service
-        shell: powershell
-        run: |
-          $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$env:HOST_PORT/" -TimeoutSec 30
-          if ($response.StatusCode -ne 200) {
-            throw "HTTP verification returned status $($response.StatusCode)."
+          if (-not (Test-Path -LiteralPath $env:SPAM_CD_LOG)) {
+            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "## Blue-Green deployment`n`nAvailability monitor did not produce a log.`n"
+            exit 0
           }
-          Write-Host "HTTP verification succeeded with status $($response.StatusCode)."
+
+          $rows = Import-Csv -LiteralPath $env:SPAM_CD_LOG
+          $total = @($rows).Count
+          $success = @($rows | Where-Object { $_.success -eq 'True' }).Count
+          $failed = $total - $success
+          $before = @($rows | Where-Object { $_.phase -eq 'before' }).Count
+          $during = @($rows | Where-Object { $_.phase -eq 'during' }).Count
+          $after = @($rows | Where-Object { $_.phase -eq 'after' }).Count
+
+          $times = @($rows | ForEach-Object { [DateTime]::Parse($_.timestamp) } | Sort-Object)
+          $maxGap = 0
+          for ($i = 1; $i -lt $times.Count; $i++) {
+            $gap = ($times[$i] - $times[$i - 1]).TotalSeconds
+            if ($gap -gt $maxGap) { $maxGap = $gap }
+          }
+
+          $outage = if ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
+          $mode = if ($env:SPAM_CD_MODE) { $env:SPAM_CD_MODE } else { 'unknown (deployment stopped before mode detection)' }
+          $summary = @(
+            '## Blue-Green deployment availability summary',
+            '',
+            "- Deployment mode: **$mode**",
+            "- Total requests: **$total**",
+            "- Successful requests: **$success**",
+            "- Failed requests: **$failed**",
+            "- Maximum request interval: **$([Math]::Round($maxGap, 2)) seconds**",
+            "- Service interruption detected: **$outage**",
+            '',
+            '| Phase | Requests |',
+            '|---|---:|',
+            "| Before deployment | $before |",
+            "| During deployment | $during |",
+            "| After deployment | $after |",
+            '',
+            'Every request was recorded with UTC timestamp, phase, HTTP status, success/failure, and response time in milliseconds.',
+            "Availability log artifact: ``$env:SPAM_CD_LOG``"
+          )
+          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
+
+      - name: Upload availability log
+        if: always() && env.SPAM_CD_LOG != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: spam-cd-availability-${{ github.run_id }}
+          path: ${{ env.SPAM_CD_LOG }}
