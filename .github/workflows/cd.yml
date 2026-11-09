@@ -117,7 +117,15 @@ jobs:
         shell: powershell
         run: |
           $stateDir = $env:SPAM_CD_STATE_DIR
-          $configPath = Join-Path $stateDir 'nginx.conf'
+          if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            throw 'LOCALAPPDATA environment variable is not available.'
+          }
+          $proxyConfigDir = Join-Path $env:LOCALAPPDATA 'spam-cd-proxy'
+          New-Item -ItemType Directory -Force -Path $proxyConfigDir | Out-Null
+          if (-not (Test-Path -LiteralPath $proxyConfigDir -PathType Container)) {
+            throw "Could not create persistent proxy config directory: $proxyConfigDir"
+          }
+          $configPath = Join-Path $proxyConfigDir 'nginx.conf'
           $proxyName = $env:PROXY_NAME
           $blueName = $env:BLUE_NAME
           $greenName = $env:GREEN_NAME
@@ -246,6 +254,11 @@ jobs:
             }
           }
 
+          function Normalize-PathForComparison([string]$path) {
+            if ([string]::IsNullOrWhiteSpace($path)) { return '' }
+            return (($path -replace '/', '\').TrimEnd('\')).ToLowerInvariant()
+          }
+
           $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
           $legacyRunning = docker ps --filter 'name=^spam-detection-web-app$' --format '{{.Names}}'
 
@@ -304,6 +317,29 @@ jobs:
           }
           Write-Host "Active backend determined from Nginx upstream: $activeName on port $activePort"
           Write-Host "Candidate selected as the opposite color: $candidateName on port $candidatePort"
+
+          $proxyInspect = docker inspect $proxyName | ConvertFrom-Json
+          $fixedConfigNormalized = Normalize-PathForComparison $configPath
+          $fixedMount = @($proxyInspect.Mounts | Where-Object {
+            $_.Destination -eq '/etc/nginx/nginx.conf' -and
+            (Normalize-PathForComparison $_.Source) -eq $fixedConfigNormalized
+          })
+
+          if ($fixedMount.Count -eq 0) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=proxy-migration'
+            Write-Host "Existing proxy does not mount the persistent config path. Migrating to: $configPath"
+            Set-Phase 'during'
+            Write-ProxyConfig $activePort
+            docker rm -f $proxyName | Out-Null
+            docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
+            if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) {
+              docker logs $proxyName
+              throw 'Persistent proxy config migration failed. The active application container was not removed.'
+            }
+            Write-Host 'Persistent proxy config migration completed; active backend was preserved.'
+          } else {
+            Write-Host "Existing proxy already mounts the persistent config: $configPath"
+          }
 
           Set-Phase 'during'
           docker rm -f $candidateName 2>$null
