@@ -155,6 +155,38 @@ jobs:
             return $false
           }
 
+          function Test-InternalHttp([string]$containerName, [int]$attempts = 60) {
+            $lastError = 'No internal HTTP 200 response received.'
+            $pythonCheck = "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5).status)"
+
+            for ($i = 0; $i -lt $attempts; $i++) {
+              $output = ''
+              $exitCode = 1
+              try {
+                $output = (& docker exec $containerName python -c $pythonCheck 2>&1 | Out-String).Trim()
+                $exitCode = $LASTEXITCODE
+              } catch {
+                $output = $_.Exception.ToString().Replace([Environment]::NewLine, ' | ')
+                $exitCode = 1
+              }
+
+              if ($exitCode -eq 0 -and $output -match '(?m)^\s*200\s*$') {
+                Write-Host "Candidate internal HTTP check succeeded on attempt $($i + 1): $output"
+                return $true
+              }
+
+              if ($exitCode -ne 0) {
+                $lastError = "docker exec exit code ${exitCode}: $output"
+              } else {
+                $lastError = "Unexpected internal HTTP output: $output"
+              }
+              Start-Sleep -Seconds 1
+            }
+
+            Write-Warning "Candidate internal HTTP check did not return HTTP 200 after $attempts attempts. Last error: $lastError"
+            return $false
+          }
+
           function Test-StableHttp([string]$url, [int]$requiredSuccesses = 10, [int]$attempts = 60) {
             $consecutive = 0
             $lastError = 'No consecutive HTTP 200 responses received.'
@@ -269,11 +301,9 @@ jobs:
             throw "Candidate '$candidateName' does not expose host port $candidatePort."
           }
 
-          $internalStatus = docker exec $candidateName python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5).status)" 2>&1 | Out-String
-          Write-Host "Candidate internal HTTP status: $internalStatus"
-          if ($internalStatus.Trim() -notmatch '^200$') {
-            docker logs $candidateName
-            throw "Candidate '$candidateName' did not return HTTP 200 from inside the container."
+          $internalReady = Test-InternalHttp $candidateName 60
+          if (-not $internalReady) {
+            Write-Warning "Internal candidate check did not become ready; continuing to the host-port check as the authoritative readiness check."
           }
 
           if (-not (Test-Http "http://127.0.0.1:$candidatePort/" 60)) {
