@@ -28,158 +28,68 @@ jobs:
       STABLE_PORT: '5000'
 
     steps:
-      - name: Start availability monitor
-        shell: powershell
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:TEMP)) {
-            throw 'Windows TEMP environment variable is not available.'
-          }
-          $stateDir = Join-Path $env:TEMP "spam-cd-$env:GITHUB_RUN_ID"
-          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
-          if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) {
-            throw "Could not create temporary CD state directory: $stateDir"
-          }
-          $phasePath = Join-Path $stateDir 'phase.txt'
-          $stopPath = Join-Path $stateDir 'stop'
-          $logPath = Join-Path $stateDir 'availability.csv'
-          $scriptPath = Join-Path $stateDir 'monitor.ps1'
-          $stdoutPath = Join-Path $stateDir 'monitor.stdout.log'
-          $stderrPath = Join-Path $stateDir 'monitor.stderr.log'
-
-          Set-Content -LiteralPath $phasePath -Value 'before' -Encoding utf8
-          Set-Content -LiteralPath $logPath -Value 'timestamp,phase,status_code,success,response_ms,error' -Encoding utf8
-          Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
-          Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
-
-          $monitorScript = @'
-          param(
-            [string]$PhasePath,
-            [string]$StopPath,
-            [string]$LogPath,
-            [string]$Url
-          )
-
-          Add-Type -AssemblyName System.Net.Http
-
-          while (-not (Test-Path -LiteralPath $StopPath)) {
-            $phase = if (Test-Path -LiteralPath $PhasePath) { (Get-Content -LiteralPath $PhasePath -Raw).Trim() } else { 'unknown' }
-            $timestamp = (Get-Date).ToUniversalTime().ToString('o')
-            $watch = [System.Diagnostics.Stopwatch]::StartNew()
-            $statusCode = ''
-            $success = $false
-            $errorText = ''
-
-            $handler = New-Object System.Net.Http.HttpClientHandler
-            $handler.UseProxy = $false
-            $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
-            $client.Timeout = [TimeSpan]::FromSeconds(5)
-            try {
-              $response = $client.GetAsync($Url).GetAwaiter().GetResult()
-              $statusCode = [int]$response.StatusCode
-              $success = ($statusCode -eq 200)
-            } catch {
-              $errorText = $_.Exception.Message.Replace(',', ';')
-              Write-Warning "Availability check failed for ${Url}: $errorText"
-            } finally {
-              $watch.Stop()
-              $client.Dispose()
-              $handler.Dispose()
-            }
-
-            $line = '{0},{1},{2},{3},{4},{5}' -f $timestamp, $phase, $statusCode, $success, $watch.ElapsedMilliseconds, $errorText
-            Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8
-            Start-Sleep -Seconds 1
-          }
-          '@
-
-          Set-Content -LiteralPath $scriptPath -Value $monitorScript -Encoding utf8
-          $originalTrackingId = $env:RUNNER_TRACKING_ID
-          try {
-            $env:RUNNER_TRACKING_ID = ''
-            $monitor = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ArgumentList @(
-              '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
-              '-PhasePath', $phasePath, '-StopPath', $stopPath, '-LogPath', $logPath,
-              '-Url', "http://127.0.0.1:$env:STABLE_PORT/"
-            )
-          } finally {
-            $env:RUNNER_TRACKING_ID = $originalTrackingId
-          }
-          Write-Host "Availability monitor started with PID $($monitor.Id)."
-
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_STATE_DIR=$stateDir"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_PID=$($monitor.Id)"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_LOG=$logPath"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_PHASE=$phasePath"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_STOP=$stopPath"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_STDOUT=$stdoutPath"
-          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_MONITOR_STDERR=$stderrPath"
-
-          $firstRequestRecorded = $false
-          $deadline = (Get-Date).AddSeconds(30)
-          while ((Get-Date) -lt $deadline) {
-            $monitorProcess = Get-Process -Id $monitor.Id -ErrorAction SilentlyContinue
-            $dataRows = @()
-            if (Test-Path -LiteralPath $logPath) {
-              $dataRows = @(Get-Content -LiteralPath $logPath | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            }
-            if ($dataRows.Count -ge 1) {
-              $firstRequestRecorded = $true
-              Write-Host "Availability monitor is alive and recorded its first request."
-              break
-            }
-            if (-not $monitorProcess) {
-              Write-Host 'Availability monitor exited before recording its first request.'
-              if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
-              if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
-              throw 'Availability monitor stopped before recording its first request.'
-            }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $firstRequestRecorded) {
-            Write-Host 'Availability monitor did not record a request within 30 seconds.'
-            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
-            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
-            throw 'Availability monitor startup verification failed.'
-          }
-
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull latest image
-        shell: powershell
-        run: docker pull $env:IMAGE_NAME
-
-      - name: Deploy blue-green candidate and switch traffic
+      - name: Monitor and deploy Blue-Green in one PowerShell step
         shell: powershell
         run: |
-          $stateDir = $env:SPAM_CD_STATE_DIR
-          if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-            throw 'LOCALAPPDATA environment variable is not available.'
-          }
-          $proxyConfigDir = Join-Path $env:LOCALAPPDATA 'spam-cd-proxy'
-          New-Item -ItemType Directory -Force -Path $proxyConfigDir | Out-Null
-          if (-not (Test-Path -LiteralPath $proxyConfigDir -PathType Container)) {
-            throw "Could not create persistent proxy config directory: $proxyConfigDir"
-          }
-          $configPath = Join-Path $proxyConfigDir 'nginx.conf'
-          $proxyName = $env:PROXY_NAME
-          $blueName = $env:BLUE_NAME
-          $greenName = $env:GREEN_NAME
-
-          Add-Type -AssemblyName System.Net.Http
+          $stateDir = $null
+          $phasePath = $null
+          $stopPath = $null
+          $logPath = $null
+          $stdoutPath = $null
+          $stderrPath = $null
+          $monitor = $null
+          $deploymentError = $null
+          $verificationError = $null
+          $mode = 'unknown'
 
           function Set-Phase([string]$phase) {
-            Set-Content -LiteralPath $env:SPAM_CD_PHASE -Value $phase -Encoding utf8
+            Set-Content -LiteralPath $phasePath -Value $phase -Encoding utf8
+            Write-Host "Availability phase changed to '$phase'."
           }
 
-          function Test-Http([string]$url, [int]$attempts = 30) {
+          function Assert-Monitor([string]$expectedPhase) {
+            if (-not $monitor) { throw "Availability monitor was not started for phase '$expectedPhase'." }
+            $monitorProcess = Get-Process -Id $monitor.Id -ErrorAction SilentlyContinue
+            if (-not $monitorProcess) {
+              if ($stdoutPath -and (Test-Path -LiteralPath $stdoutPath)) { Get-Content -LiteralPath $stdoutPath }
+              if ($stderrPath -and (Test-Path -LiteralPath $stderrPath)) { Get-Content -LiteralPath $stderrPath }
+              throw "Availability monitor PID $($monitor.Id) is not running at phase '$expectedPhase'."
+            }
+            $actualPhase = (Get-Content -LiteralPath $phasePath -Raw).Trim()
+            Write-Host "Availability monitor PID $($monitor.Id) is alive; phase='$actualPhase'."
+            if ($actualPhase -ne $expectedPhase) {
+              throw "Availability monitor phase mismatch: expected '$expectedPhase', actual '$actualPhase'."
+            }
+          }
+
+          function Wait-ForPhaseRequest([string]$phase, [int]$timeoutSeconds = 30) {
+            $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              if (Test-Path -LiteralPath $logPath) {
+                $rows = @(Get-Content -LiteralPath $logPath | Select-Object -Skip 1 | Where-Object { $_ -match "^[^,]+,$phase," })
+                if ($rows.Count -ge 1) {
+                  Write-Host "Availability monitor recorded a '$phase' request."
+                  return
+                }
+              }
+              Assert-Monitor $phase
+              Start-Sleep -Seconds 1
+            }
+            throw "Availability monitor did not record a '$phase' request within $timeoutSeconds seconds."
+          }
+
+          function Test-Http([string]$url, [int]$attempts = 60) {
+            Add-Type -AssemblyName System.Net.Http
             $lastError = 'No HTTP 200 response received.'
             for ($i = 0; $i -lt $attempts; $i++) {
-              $client = $null
               $handler = $null
+              $client = $null
               try {
                 $handler = New-Object System.Net.Http.HttpClientHandler
                 $handler.UseProxy = $false
@@ -187,12 +97,11 @@ jobs:
                 $client.Timeout = [TimeSpan]::FromSeconds(5)
                 $response = $client.GetAsync($url).GetAwaiter().GetResult()
                 $statusCode = [int]$response.StatusCode
-                $client.Dispose()
-                $handler.Dispose()
                 if ($statusCode -eq 200) { return $true }
                 $lastError = "HTTP status $statusCode"
               } catch {
                 $lastError = $_.Exception.ToString().Replace([Environment]::NewLine, ' | ')
+              } finally {
                 if ($client) { $client.Dispose() }
                 if ($handler) { $handler.Dispose() }
               }
@@ -205,7 +114,6 @@ jobs:
           function Test-InternalHttp([string]$containerName, [int]$attempts = 60) {
             $lastError = 'No internal HTTP 200 response received.'
             $pythonCheck = "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5000/', timeout=5).status)"
-
             for ($i = 0; $i -lt $attempts; $i++) {
               $output = ''
               $exitCode = 1
@@ -216,25 +124,20 @@ jobs:
                 $output = $_.Exception.ToString().Replace([Environment]::NewLine, ' | ')
                 $exitCode = 1
               }
-
               if ($exitCode -eq 0 -and $output -match '(?m)^\s*200\s*$') {
                 Write-Host "Candidate internal HTTP check succeeded on attempt $($i + 1): $output"
                 return $true
               }
-
-              if ($exitCode -ne 0) {
-                $lastError = "docker exec exit code ${exitCode}: $output"
-              } else {
-                $lastError = "Unexpected internal HTTP output: $output"
-              }
+              if ($exitCode -ne 0) { $lastError = "docker exec exit code ${exitCode}: $output" }
+              else { $lastError = "Unexpected internal HTTP output: $output" }
               Start-Sleep -Seconds 1
             }
-
-            Write-Warning "Candidate internal HTTP check did not return HTTP 200 after $attempts attempts. Last error: $lastError"
+            Write-Warning "Candidate internal HTTP check failed after $attempts attempts. Last error: $lastError"
             return $false
           }
 
           function Test-StableHttp([string]$url, [int]$requiredSuccesses = 10, [int]$attempts = 60) {
+            Add-Type -AssemblyName System.Net.Http
             $consecutive = 0
             $lastError = 'No consecutive HTTP 200 responses received.'
             for ($i = 0; $i -lt $attempts; $i++) {
@@ -265,38 +168,16 @@ jobs:
             return $false
           }
 
-          function Assert-Monitor([string]$expectedPhase) {
-            $monitorPid = [int]$env:SPAM_CD_MONITOR_PID
-            $monitorProcess = Get-Process -Id $monitorPid -ErrorAction SilentlyContinue
-            if (-not $monitorProcess) {
-              if ($env:SPAM_CD_MONITOR_STDOUT -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDOUT)) { Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDOUT }
-              if ($env:SPAM_CD_MONITOR_STDERR -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDERR)) { Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDERR }
-              throw "Availability monitor PID $monitorPid is not running at phase '$expectedPhase'."
-            }
-            $actualPhase = (Get-Content -LiteralPath $env:SPAM_CD_PHASE -Raw).Trim()
-            Write-Host "Availability monitor PID $monitorPid is alive; phase file is '$actualPhase'. Expected '$expectedPhase'."
-            if ($actualPhase -ne $expectedPhase) {
-              throw "Availability monitor phase mismatch: expected '$expectedPhase', actual '$actualPhase'."
-            }
+          function Get-NginxConfigDump {
+            $output = (& docker exec $proxyName sh -c 'nginx -T 2>&1' 2>&1 | Out-String).Trim()
+            $exitCode = $LASTEXITCODE
+            [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
           }
 
-          function Wait-ForPhaseRequest([string]$phase, [int]$timeoutSeconds = 30) {
-            $deadline = (Get-Date).AddSeconds($timeoutSeconds)
-            while ((Get-Date) -lt $deadline) {
-              if (Test-Path -LiteralPath $env:SPAM_CD_LOG) {
-                $rows = @(Get-Content -LiteralPath $env:SPAM_CD_LOG | Select-Object -Skip 1 | Where-Object { $_ -match "^[^,]+,$phase," })
-                if ($rows.Count -ge 1) {
-                  Write-Host "Availability monitor recorded a '$phase' request."
-                  return
-                }
-              }
-              Assert-Monitor $phase
-              Start-Sleep -Seconds 1
-            }
-            throw "Availability monitor did not record a '$phase' request within $timeoutSeconds seconds."
+          function Normalize-PathForComparison([string]$path) {
+            if ([string]::IsNullOrWhiteSpace($path)) { return '' }
+            return (($path -replace '/', '\').TrimEnd('\')).ToLowerInvariant()
           }
-
-          Assert-Monitor 'before'
 
           function Write-ProxyConfig([string]$backendPort) {
             $content = @"
@@ -317,269 +198,202 @@ jobs:
             [System.IO.File]::WriteAllText($configPath, $content, $utf8NoBom)
           }
 
-          function Get-NginxConfigDump {
-            $output = (& docker exec $proxyName sh -c 'nginx -T 2>&1' 2>&1 | Out-String).Trim()
-            $exitCode = $LASTEXITCODE
-            [pscustomobject]@{
-              Output = $output
-              ExitCode = $exitCode
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:TEMP)) { throw 'Windows TEMP environment variable is not available.' }
+            $stateDir = Join-Path $env:TEMP "spam-cd-$env:GITHUB_RUN_ID"
+            New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+            if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) { throw "Could not create state directory: $stateDir" }
+            $phasePath = Join-Path $stateDir 'phase.txt'
+            $stopPath = Join-Path $stateDir 'stop'
+            $logPath = Join-Path $stateDir 'availability.csv'
+            $scriptPath = Join-Path $stateDir 'monitor.ps1'
+            $stdoutPath = Join-Path $stateDir 'monitor.stdout.log'
+            $stderrPath = Join-Path $stateDir 'monitor.stderr.log'
+
+            Set-Content -LiteralPath $phasePath -Value 'before' -Encoding utf8
+            Set-Content -LiteralPath $logPath -Value 'timestamp,phase,status_code,success,response_ms,error' -Encoding utf8
+            Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $stdoutPath,$stderrPath -Force -ErrorAction SilentlyContinue
+
+            $monitorScript = @'
+          param([string]$PhasePath, [string]$StopPath, [string]$LogPath, [string]$Url)
+          Add-Type -AssemblyName System.Net.Http
+          while (-not (Test-Path -LiteralPath $StopPath)) {
+            $phase = (Get-Content -LiteralPath $PhasePath -Raw).Trim()
+            $timestamp = (Get-Date).ToUniversalTime().ToString('o')
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $statusCode = ''
+            $success = $false
+            $errorText = ''
+            $handler = New-Object System.Net.Http.HttpClientHandler
+            $handler.UseProxy = $false
+            $client = New-Object -TypeName System.Net.Http.HttpClient -ArgumentList $handler
+            $client.Timeout = [TimeSpan]::FromSeconds(5)
+            try {
+              $response = $client.GetAsync($Url).GetAwaiter().GetResult()
+              $statusCode = [int]$response.StatusCode
+              $success = ($statusCode -eq 200)
+            } catch {
+              $errorText = $_.Exception.ToString().Replace(',', ';').Replace([Environment]::NewLine, ' | ')
+              Write-Warning "Availability check failed for ${Url}: $errorText"
+            } finally {
+              $watch.Stop()
+              $client.Dispose()
+              $handler.Dispose()
             }
+            $line = '{0},{1},{2},{3},{4},{5}' -f $timestamp, $phase, $statusCode, $success, $watch.ElapsedMilliseconds, $errorText
+            Add-Content -LiteralPath $LogPath -Value $line -Encoding utf8
+            Start-Sleep -Seconds 1
           }
+          '@
+            Set-Content -LiteralPath $scriptPath -Value $monitorScript -Encoding utf8
 
-          function Normalize-PathForComparison([string]$path) {
-            if ([string]::IsNullOrWhiteSpace($path)) { return '' }
-            return (($path -replace '/', '\').TrimEnd('\')).ToLowerInvariant()
-          }
-
-          $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
-          $legacyRunning = docker ps --filter 'name=^spam-detection-web-app$' --format '{{.Names}}'
-
-          if (-not $proxyRunning) {
-            if ($legacyRunning) {
-              throw "Initial Blue-Green setup is required: legacy container '$legacyRunning' owns port 5000. It was left running to avoid downtime. Perform the one-time proxy migration before rerunning CD."
+            $originalTrackingId = $env:RUNNER_TRACKING_ID
+            try {
+              $env:RUNNER_TRACKING_ID = ''
+              $monitor = Start-Process -FilePath powershell.exe -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$scriptPath,'-PhasePath',$phasePath,'-StopPath',$stopPath,'-LogPath',$logPath,'-Url',"http://127.0.0.1:$env:STABLE_PORT/")
+            } finally {
+              $env:RUNNER_TRACKING_ID = $originalTrackingId
             }
-
-            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=initial-setup'
+            Write-Host "Availability monitor started with PID $($monitor.Id)."
+            Assert-Monitor 'before'
+            Wait-ForPhaseRequest 'before'
             Set-Phase 'during'
             Assert-Monitor 'during'
             Wait-ForPhaseRequest 'during'
-            docker rm -f $blueName $greenName 2>$null
-            docker run -d --name $blueName --restart unless-stopped -p "127.0.0.1:$env:BLUE_PORT`:5000" $env:IMAGE_NAME | Out-Null
-            if (-not (Test-Http "http://127.0.0.1:$env:BLUE_PORT/")) {
-              docker logs $blueName
-              throw 'Blue candidate failed its direct HTTP health check.'
+
+            if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { throw 'LOCALAPPDATA environment variable is not available.' }
+            $proxyConfigDir = Join-Path $env:LOCALAPPDATA 'spam-cd-proxy'
+            New-Item -ItemType Directory -Force -Path $proxyConfigDir | Out-Null
+            if (-not (Test-Path -LiteralPath $proxyConfigDir -PathType Container)) { throw "Could not create proxy config directory: $proxyConfigDir" }
+            $configPath = Join-Path $proxyConfigDir 'nginx.conf'
+            $proxyName = $env:PROXY_NAME
+            $blueName = $env:BLUE_NAME
+            $greenName = $env:GREEN_NAME
+
+            docker pull $env:IMAGE_NAME
+            $proxyRunning = docker ps --filter "name=^$proxyName$" --format '{{.Names}}'
+            $legacyRunning = docker ps --filter 'name=^spam-detection-web-app$' --format '{{.Names}}'
+
+            if (-not $proxyRunning) {
+              if ($legacyRunning) { throw "Legacy container '$legacyRunning' owns port 5000. It was left running; perform the one-time proxy migration." }
+              $mode = 'initial-setup'
+              Set-Phase 'during'
+              Assert-Monitor 'during'
+              Wait-ForPhaseRequest 'during'
+              docker rm -f $blueName $greenName 2>$null
+              docker run -d --name $blueName --restart unless-stopped -p "127.0.0.1:$env:BLUE_PORT`:5000" $env:IMAGE_NAME | Out-Null
+              if (-not (Test-InternalHttp $blueName 60) -and -not (Test-Http "http://127.0.0.1:$env:BLUE_PORT/" 60)) { docker logs $blueName; throw 'Blue candidate failed health checks.' }
+              Write-ProxyConfig $env:BLUE_PORT
+              docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) { docker logs $proxyName; throw 'Initial proxy health check failed.' }
+              Set-Phase 'after'
+              Assert-Monitor 'after'
+              Wait-ForPhaseRequest 'after'
+              Start-Sleep -Seconds 10
+            } else {
+              $proxyConfig = Get-NginxConfigDump
+              if ($proxyConfig.ExitCode -ne 0) { throw "Could not read current Nginx config: $($proxyConfig.Output)" }
+              $currentConfig = $proxyConfig.Output
+              if ($currentConfig -match 'host\.docker\.internal:5001') { $activeName=$blueName; $activePort=$env:BLUE_PORT; $candidateName=$greenName; $candidatePort=$env:GREEN_PORT }
+              elseif ($currentConfig -match 'host\.docker\.internal:5002') { $activeName=$greenName; $activePort=$env:GREEN_PORT; $candidateName=$blueName; $candidatePort=$env:BLUE_PORT }
+              else { throw 'Current Nginx upstream is not Blue or Green.' }
+              $activeState = docker inspect --format '{{.State.Status}}' $activeName 2>&1 | Out-String
+              if ($activeState.Trim() -ne 'running') { throw "Active container '$activeName' is not running." }
+
+              $proxyInspect = docker inspect $proxyName | ConvertFrom-Json
+              $fixedConfigNormalized = Normalize-PathForComparison $configPath
+              $fixedMount = @($proxyInspect.Mounts | Where-Object { $_.Destination -eq '/etc/nginx/nginx.conf' -and (Normalize-PathForComparison $_.Source) -eq $fixedConfigNormalized })
+              if ($fixedMount.Count -eq 0) {
+                $mode = 'proxy-migration'
+                Set-Phase 'during'
+                Assert-Monitor 'during'
+                Wait-ForPhaseRequest 'during'
+                Write-ProxyConfig $activePort
+                docker rm -f $proxyName | Out-Null
+                docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
+                if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) { docker logs $proxyName; throw 'Proxy migration health check failed.' }
+              } else { $mode = 'subsequent-redeploy' }
+
+              Set-Phase 'during'
+              Assert-Monitor 'during'
+              Wait-ForPhaseRequest 'during'
+              docker rm -f $candidateName 2>$null
+              docker run -d --name $candidateName --restart unless-stopped -p "127.0.0.1:$candidatePort`:5000" $env:IMAGE_NAME | Out-Null
+              $candidateState = docker inspect --format '{{.State.Status}}' $candidateName 2>&1 | Out-String
+              docker ps --filter "name=^$candidateName$"
+              $portOutput = docker port $candidateName 5000/tcp 2>&1 | Out-String
+              Write-Host "Candidate docker state: $candidateState"
+              Write-Host "Candidate docker port mapping:`n$portOutput"
+              if ($candidateState.Trim() -ne 'running' -or $portOutput -notmatch "127\.0\.0\.1:$candidatePort") { docker logs $candidateName; throw 'Candidate container state or port mapping is invalid.' }
+              $internalReady = Test-InternalHttp $candidateName 60
+              if (-not $internalReady) { Write-Warning 'Internal check did not become ready; host-port check remains authoritative.' }
+              if (-not (Test-Http "http://127.0.0.1:$candidatePort/" 60)) { docker logs $candidateName; throw "Candidate '$candidateName' failed host HTTP health check." }
+
+              Write-ProxyConfig $candidatePort
+              docker exec $proxyName nginx -t
+              docker exec $proxyName nginx -s reload
+              $loadedConfigResult = Get-NginxConfigDump
+              if ($loadedConfigResult.ExitCode -ne 0 -or $loadedConfigResult.Output -notmatch "host\.docker\.internal:$candidatePort") {
+                Write-Host "Post-reload nginx -T output: $($loadedConfigResult.Output)"
+                Write-ProxyConfig $activePort
+                docker exec $proxyName nginx -t
+                docker exec $proxyName nginx -s reload
+                docker rm -f $candidateName | Out-Null
+                throw 'Nginx reload verification failed; traffic was not switched.'
+              }
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) {
+                Write-ProxyConfig $activePort
+                docker exec $proxyName nginx -t
+                docker exec $proxyName nginx -s reload
+                if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) { throw 'Proxy rollback health check failed; both containers were left for investigation.' }
+                docker rm -f $candidateName | Out-Null
+                throw 'Stable proxy health check failed; traffic was rolled back.'
+              }
+              Start-Sleep -Seconds 2
+              if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) { throw 'Post-switch stabilization failed; active container was not removed.' }
+              docker rm -f $activeName | Out-Null
+              Set-Phase 'after'
+              Assert-Monitor 'after'
+              Wait-ForPhaseRequest 'after'
+              Start-Sleep -Seconds 10
             }
-
-            Write-ProxyConfig $env:BLUE_PORT
-            docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
-            if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) {
-              docker logs $proxyName
-              throw 'Initial proxy health check failed.'
+          } catch {
+            $deploymentError = $_
+            Write-Error $_
+          } finally {
+            if ($monitor -and (Get-Process -Id $monitor.Id -ErrorAction SilentlyContinue)) {
+              New-Item -ItemType File -Force -Path $stopPath | Out-Null
+              Wait-Process -Id $monitor.Id -Timeout 15 -ErrorAction SilentlyContinue
             }
-            Set-Phase 'after'
-            Assert-Monitor 'after'
-            Wait-ForPhaseRequest 'after'
-            Start-Sleep -Seconds 10
-            Write-Host 'Initial Blue-Green environment created with blue active.'
-            exit 0
+            if ($stdoutPath -and (Test-Path -LiteralPath $stdoutPath)) { Write-Host '--- monitor stdout ---'; Get-Content -LiteralPath $stdoutPath }
+            if ($stderrPath -and (Test-Path -LiteralPath $stderrPath)) { Write-Warning '--- monitor stderr ---'; Get-Content -LiteralPath $stderrPath }
+            if ($logPath -and (Test-Path -LiteralPath $logPath)) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value "SPAM_CD_LOG=$logPath"
+              $rows = @(Import-Csv -LiteralPath $logPath)
+              $total = $rows.Count
+              $success = @($rows | Where-Object { $_.success -eq 'True' }).Count
+              $failed = $total - $success
+              $before = @($rows | Where-Object { $_.phase -eq 'before' }).Count
+              $during = @($rows | Where-Object { $_.phase -eq 'during' }).Count
+              $after = @($rows | Where-Object { $_.phase -eq 'after' }).Count
+              $beforeSuccess = @($rows | Where-Object { $_.phase -eq 'before' -and $_.success -eq 'True' }).Count
+              $duringSuccess = @($rows | Where-Object { $_.phase -eq 'during' -and $_.success -eq 'True' }).Count
+              $afterSuccess = @($rows | Where-Object { $_.phase -eq 'after' -and $_.success -eq 'True' }).Count
+              $beforeFailed = $before - $beforeSuccess
+              $duringFailed = $during - $duringSuccess
+              $afterFailed = $after - $afterSuccess
+              $times = @($rows | ForEach-Object { [DateTime]::Parse($_.timestamp) } | Sort-Object)
+              $maxGap = 0
+              for ($i=1; $i -lt $times.Count; $i++) { $gap=($times[$i]-$times[$i-1]).TotalSeconds; if($gap -gt $maxGap){$maxGap=$gap} }
+              $outage = if ($total -eq 0) { 'UNKNOWN — no HTTP requests were recorded; verification failed' } elseif ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
+              $summary = @('## Blue-Green deployment availability summary','',"- Deployment mode: **$mode**","- Total requests: **$total**","- Successful requests: **$success**","- Failed requests: **$failed**","- Before successful/failed: **$beforeSuccess / $beforeFailed**","- During successful/failed: **$duringSuccess / $duringFailed**","- After successful/failed: **$afterSuccess / $afterFailed**","- Maximum request interval: **$([Math]::Round($maxGap,2)) seconds**","- Service interruption detected: **$outage**",'',"| Phase | Requests |","|---|---:|","| Before deployment | $before |","| During deployment | $during |","| After deployment | $after |",'',"Availability log: ``$logPath``")
+              Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
+              if ($total -eq 0 -or $before -lt 1 -or $during -lt 1 -or $after -lt 1) { $verificationError = "Availability verification incomplete: total=$total, before=$before, during=$during, after=$after" }
+            } else { $verificationError = 'Availability CSV was not created.' }
           }
-
-          $proxyConfig = Get-NginxConfigDump
-          Write-Host "Current Nginx config dump exit code: $($proxyConfig.ExitCode)"
-          if ($proxyConfig.ExitCode -ne 0) {
-            Write-Host "Current Nginx config dump output: $($proxyConfig.Output)"
-            throw 'Could not read the current Nginx configuration. No container was removed.'
-          }
-
-          $currentConfig = $proxyConfig.Output
-          if ($currentConfig -match 'host\.docker\.internal:5001') {
-            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
-            $activeName = $blueName
-            $activePort = $env:BLUE_PORT
-            $candidateName = $greenName
-            $candidatePort = $env:GREEN_PORT
-          } elseif ($currentConfig -match 'host\.docker\.internal:5002') {
-            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=subsequent-redeploy'
-            $activeName = $greenName
-            $activePort = $env:GREEN_PORT
-            $candidateName = $blueName
-            $candidatePort = $env:BLUE_PORT
-          } else {
-            throw 'Current Nginx upstream is neither host.docker.internal:5001 nor host.docker.internal:5002. No container was removed.'
-          }
-
-          $activeState = docker inspect --format '{{.State.Status}}' $activeName 2>&1 | Out-String
-          if ($activeState.Trim() -ne 'running') {
-            throw "Nginx points to '$activeName' on port $activePort, but that active container is not running. No container was removed."
-          }
-          Write-Host "Active backend determined from Nginx upstream: $activeName on port $activePort"
-          Write-Host "Candidate selected as the opposite color: $candidateName on port $candidatePort"
-
-          $proxyInspect = docker inspect $proxyName | ConvertFrom-Json
-          $fixedConfigNormalized = Normalize-PathForComparison $configPath
-          $fixedMount = @($proxyInspect.Mounts | Where-Object {
-            $_.Destination -eq '/etc/nginx/nginx.conf' -and
-            (Normalize-PathForComparison $_.Source) -eq $fixedConfigNormalized
-          })
-
-          if ($fixedMount.Count -eq 0) {
-            Add-Content -LiteralPath $env:GITHUB_ENV -Value 'SPAM_CD_MODE=proxy-migration'
-            Write-Host "Existing proxy does not mount the persistent config path. Migrating to: $configPath"
-            Set-Phase 'during'
-            Assert-Monitor 'during'
-            Wait-ForPhaseRequest 'during'
-            Write-ProxyConfig $activePort
-            docker rm -f $proxyName | Out-Null
-            docker run -d --name $proxyName --restart unless-stopped -p "127.0.0.1:$env:STABLE_PORT`:5000" --mount "type=bind,source=$configPath,target=/etc/nginx/nginx.conf,readonly" nginx:alpine | Out-Null
-            if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) {
-              docker logs $proxyName
-              throw 'Persistent proxy config migration failed. The active application container was not removed.'
-            }
-            Write-Host 'Persistent proxy config migration completed; active backend was preserved.'
-          } else {
-            Write-Host "Existing proxy already mounts the persistent config: $configPath"
-          }
-
-          Set-Phase 'during'
-          Assert-Monitor 'during'
-          Wait-ForPhaseRequest 'during'
-          docker rm -f $candidateName 2>$null
-          docker run -d --name $candidateName --restart unless-stopped -p "127.0.0.1:$candidatePort`:5000" $env:IMAGE_NAME | Out-Null
-
-          $candidateState = docker inspect --format '{{.State.Status}}' $candidateName 2>&1 | Out-String
-          Write-Host "Candidate docker state: $candidateState"
-          docker ps --filter "name=^$candidateName$"
-          $portOutput = docker port $candidateName 5000/tcp 2>&1 | Out-String
-          Write-Host "Candidate docker port mapping:`n$portOutput"
-          if ($candidateState.Trim() -ne 'running') {
-            docker logs $candidateName
-            throw "Candidate '$candidateName' is not running."
-          }
-          if ($portOutput -notmatch "127\.0\.0\.1:$candidatePort") {
-            docker logs $candidateName
-            throw "Candidate '$candidateName' does not expose host port $candidatePort."
-          }
-
-          $internalReady = Test-InternalHttp $candidateName 60
-          if (-not $internalReady) {
-            Write-Warning "Internal candidate check did not become ready; continuing to the host-port check as the authoritative readiness check."
-          }
-
-          if (-not (Test-Http "http://127.0.0.1:$candidatePort/" 60)) {
-            docker logs $candidateName
-            throw "Candidate '$candidateName' failed its direct HTTP health check. Active '$activeName' was not changed."
-          }
-
-          Write-ProxyConfig $candidatePort
-          docker exec $proxyName nginx -t
-          docker exec $proxyName nginx -s reload
-
-          $loadedConfigResult = Get-NginxConfigDump
-          Write-Host "Post-reload Nginx config dump exit code: $($loadedConfigResult.ExitCode)"
-          if ($loadedConfigResult.ExitCode -ne 0) {
-            Write-Host "Post-reload Nginx config dump output: $($loadedConfigResult.Output)"
-            Write-ProxyConfig $activePort
-            docker exec $proxyName nginx -t
-            docker exec $proxyName nginx -s reload
-            throw 'nginx -T failed after reload. Traffic was not considered switched and no active container was removed.'
-          }
-
-          $loadedConfig = $loadedConfigResult.Output
-          if ($loadedConfig -notmatch "host\.docker\.internal:$candidatePort") {
-            Write-ProxyConfig $activePort
-            docker exec $proxyName nginx -t
-            docker exec $proxyName nginx -s reload
-            docker rm -f $candidateName | Out-Null
-            throw "Nginx did not report the candidate upstream host.docker.internal:$candidatePort after reload. Traffic was not switched."
-          }
-
-          if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 10 60)) {
-            Write-ProxyConfig $activePort
-            docker exec $proxyName nginx -s reload
-            if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) {
-              throw "Stable proxy health check failed during rollback. The candidate was not removed so the failure remains visible."
-            }
-            docker rm -f $candidateName | Out-Null
-            throw "Stable proxy health check failed after switch. Traffic was rolled back to '$activeName'."
-          }
-
-          Start-Sleep -Seconds 2
-          if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) {
-            Write-ProxyConfig $activePort
-            docker exec $proxyName nginx -t
-            docker exec $proxyName nginx -s reload
-            if (-not (Test-StableHttp "http://127.0.0.1:$env:STABLE_PORT/" 5 30)) {
-              throw "Post-switch stabilization failed and rollback health check also failed. The old container '$activeName' and candidate '$candidateName' were left for investigation."
-            }
-            docker rm -f $candidateName | Out-Null
-            throw "Post-switch stabilization failed. Traffic was rolled back to '$activeName'; the old container was not removed before stable service was restored."
-          }
-
-          docker rm -f $activeName | Out-Null
-          Set-Phase 'after'
-          Assert-Monitor 'after'
-          Wait-ForPhaseRequest 'after'
-          Start-Sleep -Seconds 10
-          Write-Host "Traffic switched from '$activeName' to '$candidateName'."
-
-      - name: Stop availability monitor and write Job Summary
-        if: always()
-        shell: powershell
-        run: |
-          if ($env:SPAM_CD_STOP -and (Test-Path -LiteralPath $env:SPAM_CD_STOP)) {
-            New-Item -ItemType File -Force -Path $env:SPAM_CD_STOP | Out-Null
-          }
-          if ($env:SPAM_CD_MONITOR_PID) {
-            Wait-Process -Id ([int]$env:SPAM_CD_MONITOR_PID) -Timeout 15 -ErrorAction SilentlyContinue
-          }
-
-          if ($env:SPAM_CD_MONITOR_STDOUT -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDOUT)) {
-            Write-Host '--- availability monitor stdout ---'
-            Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDOUT
-          }
-          if ($env:SPAM_CD_MONITOR_STDERR -and (Test-Path -LiteralPath $env:SPAM_CD_MONITOR_STDERR)) {
-            Write-Warning '--- availability monitor stderr ---'
-            Get-Content -LiteralPath $env:SPAM_CD_MONITOR_STDERR
-          }
-
-          if ([string]::IsNullOrWhiteSpace($env:SPAM_CD_LOG) -or -not (Test-Path -LiteralPath $env:SPAM_CD_LOG)) {
-            Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value "## Blue-Green deployment`n`nAvailability monitor did not produce a log. Verification failed.`n"
-            throw 'Availability monitor log is missing.'
-          }
-
-          $rows = Import-Csv -LiteralPath $env:SPAM_CD_LOG
-          $total = @($rows).Count
-          $success = @($rows | Where-Object { $_.success -eq 'True' }).Count
-          $failed = $total - $success
-          $before = @($rows | Where-Object { $_.phase -eq 'before' }).Count
-          $during = @($rows | Where-Object { $_.phase -eq 'during' }).Count
-          $after = @($rows | Where-Object { $_.phase -eq 'after' }).Count
-          $beforeSuccess = @($rows | Where-Object { $_.phase -eq 'before' -and $_.success -eq 'True' }).Count
-          $duringSuccess = @($rows | Where-Object { $_.phase -eq 'during' -and $_.success -eq 'True' }).Count
-          $afterSuccess = @($rows | Where-Object { $_.phase -eq 'after' -and $_.success -eq 'True' }).Count
-          $beforeFailed = $before - $beforeSuccess
-          $duringFailed = $during - $duringSuccess
-          $afterFailed = $after - $afterSuccess
-
-          $times = @($rows | ForEach-Object { [DateTime]::Parse($_.timestamp) } | Sort-Object)
-          $maxGap = 0
-          for ($i = 1; $i -lt $times.Count; $i++) {
-            $gap = ($times[$i] - $times[$i - 1]).TotalSeconds
-            if ($gap -gt $maxGap) { $maxGap = $gap }
-          }
-
-          $outage = if ($total -eq 0) { 'UNKNOWN — no HTTP requests were recorded; verification failed' } elseif ($failed -gt 0) { 'YES — one or more HTTP requests failed' } else { 'NO — all recorded HTTP requests succeeded' }
-          $mode = if ($env:SPAM_CD_MODE) { $env:SPAM_CD_MODE } else { 'unknown (deployment stopped before mode detection)' }
-          $summary = @(
-            '## Blue-Green deployment availability summary',
-            '',
-            "- Deployment mode: **$mode**",
-            "- Total requests: **$total**",
-            "- Successful requests: **$success**",
-            "- Failed requests: **$failed**",
-            "- Before successful/failed: **$beforeSuccess / $beforeFailed**",
-            "- During successful/failed: **$duringSuccess / $duringFailed**",
-            "- After successful/failed: **$afterSuccess / $afterFailed**",
-            "- Maximum request interval: **$([Math]::Round($maxGap, 2)) seconds**",
-            "- Service interruption detected: **$outage**",
-            '',
-            '| Phase | Requests |',
-            '|---|---:|',
-            "| Before deployment | $before (success: $beforeSuccess, failed: $beforeFailed) |",
-            "| During deployment | $during (success: $duringSuccess, failed: $duringFailed) |",
-            "| After deployment | $after (success: $afterSuccess, failed: $afterFailed) |",
-            '',
-            'Every request was recorded with UTC timestamp, phase, HTTP status, success/failure, and response time in milliseconds.',
-            "Availability log artifact: ``$env:SPAM_CD_LOG``"
-          )
-          Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary -join [Environment]::NewLine)
-
-          if ($total -eq 0) {
-            throw 'Availability verification failed: Total requests is 0.'
-          }
-          if ($before -lt 1 -or $during -lt 1 -or $after -lt 1) {
-            throw "Availability verification failed: each phase needs at least one request (before=$before, during=$during, after=$after)."
-          }
+          if ($deploymentError) { throw $deploymentError }
+          if ($verificationError) { throw $verificationError }
 
       - name: Upload availability log
         if: always() && env.SPAM_CD_LOG != ''
